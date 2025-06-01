@@ -38,7 +38,9 @@ class DatasetLoader:
         return self.data["train"], self.data["val"]
 
     def get_batch(self, split, batch_size, block_size):
-        batch_data = torch.randint(0, len(self.data[split]) - block_size, (batch_size,))
+        # Generate indices on CPU first
+        batch_data = torch.randint(0, len(self.data[split]) - block_size, (batch_size,), device='cpu')
+        # Stack tensors on CPU
         x = torch.stack([self.data[split][i : i + block_size] for i in batch_data])
         y = torch.stack(
             [self.data[split][i + 1 : i + block_size + 1] for i in batch_data]

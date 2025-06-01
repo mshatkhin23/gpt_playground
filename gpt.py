@@ -143,7 +143,9 @@ class GPTLanguageModel(nn.Module):
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
+        # Generate position indices on CPU first
+        pos_indices = torch.arange(T, device='cpu')
+        pos_emb = self.position_embedding_table(pos_indices.to(idx.device))  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
         logits = self.lm_head(x)  # (B,T,vocab_size)
