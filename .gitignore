@@ -48,7 +48,6 @@ checkpoints/
 logs/
 
 # Data
-data/
 *.csv
 *.json
 *.dat
