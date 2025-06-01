@@ -51,7 +51,6 @@ logs/
 data/
 *.csv
 *.json
-*.txt
 *.dat
 *.out
 *.gz

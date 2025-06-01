@@ -1,0 +1,7 @@
+torch>=2.0.0
+numpy
+pylint
+black
+transformers>=4.30.0
+torchvision
+tiktoken>=0.4.0
