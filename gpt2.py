@@ -214,6 +214,7 @@ class DataLoader:
         self.enc = tiktoken.get_encoding("gpt2")
         self.device = device
         self._load_data()
+        self.current_position = 0
 
     def _load_data(self):
         with open(self.filename, "r", encoding="utf-8") as file:
@@ -224,45 +225,55 @@ class DataLoader:
         self.data["val"] = self.data["all"][n:]
         
     def get_batch(self, split):
-        idx = torch.randint(0, len(self.data[split]) - self.T, (1,))
-        buf = self.data[split][idx : idx+self.B*self.T+1]
-        x = (buf[:-1]).view(self.B, self.T) # inputs
-        y = (buf[1:]).view(self.B, self.T) # targets
+        B, T = self.B, self.T
+        buf = self.data[split][self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        if self.current_position + (B * T + 1) > len(self.data[split]):
+            self.current_position = 0
+        # idx = torch.randint(0, len(self.data[split]) - self.T, (1,))
+        # buf = self.data[split][idx : idx+self.B*self.T+1]
+        # x = (buf[:-1]).view(self.B, self.T) # inputs
+        # y = (buf[1:]).view(self.B, self.T) # targets
         return x, y
 
         
-
+import sys
 if __name__ == "__main__":
     num_return_sequences = 5
     max_sequence_length = 20
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
-    # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #     device = "mps"
+
+    torch.set_float32_matmul_precision("high")
 
     # model = GPT2.from_pretrained("gpt2")
     model = GPT2(GPTConfig())
     # print(model)
     model.eval()
     model.to(device)
+    model = torch.compile(model)
 
     # load the data
-    data_loader = DataLoader(batch_size=4, block_size=32, device=device)
+    data_loader = DataLoader(batch_size=16, block_size=1024, device=device)
     # x, y = data_loader.get_batch("train")
 
     # train the model
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for iter in range(50):
         x, y = data_loader.get_batch("train")
         x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
         print(f"iter {iter}, loss {loss.item()}")
 
-    
+    # generate examples
     # enc = tiktoken.get_encoding("gpt2")
     # text = "Hello, I'm a language model"
     # tokens = enc.encode(text)
