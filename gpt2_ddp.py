@@ -204,9 +204,9 @@ def generate(x, model, max_length, num_return_sequences, device_type):
     
     return decoded_outputs
 
-class DataLoader:
+class DataLoaderDDP:
 
-    def __init__(self, batch_size, block_size, device):
+    def __init__(self, batch_size, block_size, device, num_processes, rank):
         self.data = {}
         self.B = batch_size
         self.T = block_size
@@ -214,7 +214,9 @@ class DataLoader:
         self.enc = tiktoken.get_encoding("gpt2")
         self.device = device
         self._load_data()
-        self.current_position = 0
+        self.current_position = rank * self.B * self.T
+        self.num_processes = num_processes
+        self.rank = rank
 
     def _load_data(self):
         with open(self.filename, "r", encoding="utf-8") as file:
@@ -230,9 +232,9 @@ class DataLoader:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T
-        if self.current_position + (B * T + 1) > len(self.data[split]):
-            self.current_position = 0
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.data[split]):
+            self.current_position = self.rank * self.B * self.T
         # idx = torch.randint(0, len(self.data[split]) - self.T, (1,))
         # buf = self.data[split][idx : idx+self.B*self.T+1]
         # x = (buf[:-1]).view(self.B, self.T) # inputs
@@ -241,25 +243,41 @@ class DataLoader:
 
         
 import time
+import os
 if __name__ == "__main__":
-    
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
 
+    # initialize the distributed process group
+    assert torch.cuda.is_available()
+    torch.distributed.init_process_group(backend="nccl")
+    rank = torch.distributed.get_rank()
+    num_processes = torch.distributed.get_world_size()
+    print(f"rank: {rank}, num_processes: {num_processes}")
+    device = f"cuda:{rank}"
+    torch.cuda.set_device(device)
+    master_process = (rank == 0)
+
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed(1337)
+
+    # init model
     torch.set_float32_matmul_precision("high")
-
     # model = GPT2.from_pretrained("gpt2")
     model = GPT2(GPTConfig(vocab_size=50304))
     # print(model)
     model.eval()
     model.to(device)
     model = torch.compile(model)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
     # load the data
     B, T = 16, 1024
-    data_loader = DataLoader(batch_size=B, block_size=T, device=device)
-    # x, y = data_loader.get_batch("train")
+    data_loader = DataLoaderDDP(
+        batch_size=B, 
+        block_size=T, 
+        device=device, 
+        num_processes=num_processes, 
+        rank=rank
+    )
 
     # gradient accumulation
     total_batch_size = 524288 # 2^19, ~0.5M tokens
@@ -267,10 +285,18 @@ if __name__ == "__main__":
     print(f"num_micro_batch_steps: {num_micro_batch_steps}")
 
     # train the model
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fused=(device == "cuda"))
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=3e-4, 
+        betas=(0.9, 0.95), 
+        eps=1e-8, 
+        weight_decay=0.1, 
+        fused=(device == "cuda")
+    )
     for iter in range(50):
         optimizer.zero_grad(set_to_none=True)
         t0 = time.time()
+        loss_sum = 0.0
         for micro_batch_step in range(num_micro_batch_steps):
             x, y = data_loader.get_batch("train")
             x, y = x.to(device), y.to(device)
@@ -278,16 +304,20 @@ if __name__ == "__main__":
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
             loss = loss / num_micro_batch_steps
+            loss_sum += loss.detach()
+            model.require_backward_grad_sync = (micro_batch_step == num_micro_batch_steps - 1)
             loss.backward()
+        torch.distributed.all_reduce(loss_sum, op=torch.distributed.ReduceOp.AVG)
 
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         torch.cuda.synchronize()
         t1 = time.time()
         dt = t1 - t0
-        tokens_processed = B * T * num_micro_batch_steps
+        tokens_processed = B * T * num_micro_batch_steps * num_processes
         tokens_per_second = tokens_processed / dt
-        print(f"iter {iter}, loss {loss.item()}, time {1000 * dt:.2f}ms, tokens/s {tokens_per_second:.2f}, norm {norm:.2f}")
+        if master_process:
+            print(f"iter {iter}, loss {loss_sum.item()}, time {1000 * dt:.2f}ms, tokens/s {tokens_per_second:.2f}, norm {norm:.2f}")
 
     # generate examples
     # num_return_sequences = 5
